@@ -1,17 +1,20 @@
 from __future__ import absolute_import
 
 import base64
-import collections
+import collections, numbers
 import io
 import re
 import inspect
 
+AUTOCONVERT_LIST = True
+REQUIRED_BY_DEFAULT = False
+
 SERIALIZER_NAME_BASE_PATTERN = r'(?P<name>(?:[a-zA-Z]\w*)(?:/(?:[a-zA-Z]\w*))?)'
 SERIALIZER_PARAM_PATTERN = r'(?P<param>\(.+\))'
 SERIALIZER_FORMAT_PATTERN = r'(?:\.(?P<format>[a-zA-Z]\w*))'
-SERIALIZER_ARRAY_PATTERN = r'(?P<array>(?:\[\d*\])*)'
+SERIALIZER_ARRAY_PATTERN = r'(?P<array>(?:\[(?:(?:\d+|\.\.\.)(?:,(?:\d+|\.\.\.))*)?\]))'
 
-SERIALIZER_NAME_PATTERN = r'(?P<fullname>{name}{param}?{fmt}?){array}'.format(
+SERIALIZER_NAME_PATTERN = r'(?P<fullname>{name}{param}?{fmt}?){array}?'.format(
         name=SERIALIZER_NAME_BASE_PATTERN,
         param=SERIALIZER_PARAM_PATTERN,
         fmt=SERIALIZER_FORMAT_PATTERN,
@@ -55,45 +58,73 @@ def _check_format(format,known_formats):
     return False
 
 def deserialize(serializer,wire_data,wire_format=None):
-    if wire_format and not serializer.can_deserialize(wire_format):
+    if wire_format and not serializer._call_can_deserialize(wire_format):
         raise SerializationError('Serializer %s does not accept format %s' % (serializer.get_name(), wire_format))
-    if serializer.is_binary(wire_format):
+    if wire_data is None:
+        if not serializer.is_nonesafe():
+            if serializer.REQUIRED:
+                raise SerializationError('Data is required!')
+            return None
+    if serializer._call_is_binary(wire_format):
         wire_data = _binary_convert(serializer, wire_format, wire_data, str2bin=True, file_ok=True)
-    deserialized_data = serializer.deserialize(wire_data,wire_format)
+    deserialized_data = serializer._call_deserialize(wire_data,wire_format)
     
     return deserialized_data
 
 def serialize(serializer, internal_data, wire_format=None):
-    if wire_format and not serializer.can_serialize(internal_data, wire_format):
+    if internal_data is None:
+        if not serializer.is_nonesafe():
+            if serializer.REQUIRED:
+                raise SerializationError('Data is required!')
+            return None
+    if wire_format and not serializer._call_can_serialize(internal_data, wire_format):
         raise SerializationError('Serializer %s cannot serialize this data to format %s' % (serializer.get_name(), wire_format))
     if wire_format is None:
-        wire_format = serializer.choose_wire_format(internal_data)
-    serialized_data = serializer.serialize(internal_data, wire_format)
-    if serializer.is_binary(wire_format):
+        wire_format = serializer._call_choose_wire_format(internal_data)
+    serialized_data = serializer._call_serialize(internal_data, wire_format)
+    if serializer._call_is_binary(wire_format):
         serialized_data = _binary_convert(serializer, wire_format, serialized_data, str2bin=False, file_ok=False)
     return serialized_data
 
 class MetaSerializerBase(type):
     def __new__(cls, name, bases, dct):
-        default_dct = {'__base_type__': None, '__unformatted_type__': None, '__parent_type__': None, 'INTERNAL_FORMAT': None, 'NAMESPACE': ''}
+        default_dct = {'__base_type__': None,
+                      '__unformatted_type__': None, 
+                      '__parent_type__': None, 
+                      'INTERNAL_FORMAT': None, 
+                      'NAMESPACE': '', 
+                      'REQUIRED': REQUIRED_BY_DEFAULT}
         
         default_dct.update(dct)
         dct = default_dct
 
         return super(MetaSerializerBase, cls).__new__(cls, name, bases, dct)
     
+    def is_nonesafe(self):
+        return False
+    
     def __getattr__(self,attr_name):
         return self.with_internal_format(attr_name)
     
     def with_internal_format(self,internal_format):
-        internal_format_str = internal_format if isinstance(internal_format,basestring) else 'COMPLEX'
-        subclass_name = self.__name__ + '__FORMAT_' + internal_format_str
         dct = {}
-        dct['__name__'] = subclass_name
         dct['__base_type__'] = self.get_base_type()
         dct['__unformatted_type__'] = self
         dct['__parent_type__'] = self
-        dct['INTERNAL_FORMAT'] = internal_format
+        dct['NAMESPACE'] = self.NAMESPACE
+        
+        if internal_format == 'required':
+            subclass_name = self.__name__ + '__REQUIRED'
+            dct['REQUIRED'] = True
+            dct['INTERNAL_FORMAT'] = self.INTERNAL_FORMAT
+        else:
+            internal_format_str = internal_format if isinstance(internal_format,basestring) else 'COMPLEX'
+            subclass_name = self.__name__ + '__FORMAT_' + internal_format_str
+            dct['INTERNAL_FORMAT'] = internal_format
+            dct['REQUIRED'] = self.REQUIRED
+        
+        dct['__name__'] = subclass_name
+        
             
         @classmethod
         def get_name(cls):
@@ -189,22 +220,60 @@ class SerializerBase(object):
     @classmethod
     def can_deserialize(cls,wire_format):
         """Returns true if this serializer can deserialize the given wire format."""
-        raise NotImplementedError('can_deserialize() not implemented in %s' % str(cls))
+        return NotImplemented
     
     @classmethod
     def can_serialize(cls,data,wire_format):
         """Returns true if this serializer can serialize into the given wire format."""
-        raise NotImplementedError('can_serialize() not implemented in %s' % str(cls))
+        return NotImplemented
     
     @classmethod
     def deserialize(cls,data,wire_format):
         """Deserialize the given data, assuming the given wire format."""
-        raise NotImplementedError('deserialize() not implemented in %s' % str(cls))
+        return NotImplemented
 
     @classmethod
     def serialize(cls,data,wire_format):
         """Serialize the given data into the given wire format."""
-        raise NotImplementedError('serialize() not implemented in %s' % str(cls))
+        return NotImplemented
+    
+    #Internal methods 
+    
+    @classmethod
+    def _call_choose_wire_format(cls,data,is_list=False):
+        return cls.choose_wire_format(data,is_list=is_list)
+    
+    @classmethod
+    def _call_is_binary(cls,wire_format):
+        return cls.is_binary(wire_format)
+    
+    @classmethod
+    def _call_can_deserialize(cls,wire_format):
+        can = cls.can_deserialize(wire_format)
+        if can is NotImplemented:
+            raise NotImplementedError('can_deserialize() not implemented in %s' % str(cls))
+        return can
+    
+    @classmethod
+    def _call_can_serialize(cls,data,wire_format):
+        can = cls.can_serialize(data, wire_format)
+        if can is NotImplemented:
+            raise NotImplementedError('can_serialize() not implemented in %s' % str(cls))
+        return can
+    
+    @classmethod
+    def _call_deserialize(cls,data,wire_format):
+        data = cls.deserialize(data,wire_format)
+        if data is NotImplemented:
+            raise NotImplementedError('deserialize() not implemented in %s' % str(cls))
+        return data
+
+    @classmethod
+    def _call_serialize(cls,data,wire_format):
+        data = cls.serialize(data,wire_format)
+        if data is NotImplemented:
+            raise NotImplementedError('serialize() not implemented in %s' % str(cls))
+        return data
 
 class Translator(object):
     """Base class for translators that can be registered on a Serializer subclass,
@@ -284,11 +353,14 @@ def _parameter_str(param_list, param_dict, parens=True):
 
 class MetaSerializer(MetaSerializerBase):
     def __new__(cls, name, bases, dct):
-        default_dct = {'TRANSLATORS': [], 'PARAMETER_LIST': [], 'PARAMETER_DICT': {}, '_PARAMETER_CHECK': None, 'INTERNAL_FORMAT': None}
+        default_dct = {'TRANSLATORS': [], 
+                       'PARAMETER_LIST': [], 
+                       'PARAMETER_DICT': {}, 
+                       '_PARAMETER_CHECK': None, 
+                       'INTERNAL_FORMAT': None}
         
         default_dct.update(dct)
         dct = default_dct
-
         return super(MetaSerializer, cls).__new__(cls, name, bases, dct)
     
     def __call__(self,*args,**kwargs):
@@ -312,9 +384,12 @@ class MetaSerializer(MetaSerializerBase):
         dct['PARAMETER_DICT'] = self.PARAMETER_DICT.copy()
         dct['PARAMETER_DICT'].update(kwargs)
         
+        dct['NAMESPACE'] = self.NAMESPACE
+        
         dct['TRANSLATORS'] = self.TRANSLATORS
         dct['_PARAMETER_CHECK'] = self._PARAMETER_CHECK
         dct['INTERNAL_FORMAT'] = self.INTERNAL_FORMAT
+        dct['REQUIRED'] = self.REQUIRED
         
         @classmethod
         def get_name(cls):
@@ -327,7 +402,7 @@ class MetaSerializer(MetaSerializerBase):
         dct['__base_type__'] = self.get_base_type()
         dct['__unformatted_type__'] = self
         dct['__parent_type__'] = self
-        dct['INTERNAL_FORMAT'] = attr_name
+        dct['NAMESPACE'] = self.NAMESPACE
         
         dct['TRANSLATORS'] = self.TRANSLATORS
         dct['PARAMETER_LIST'] = self.PARAMETER_LIST
@@ -339,20 +414,29 @@ class MetaSerializer(MetaSerializerBase):
             return self.get_name()
         dct['get_name'] = get_name
         
-        if attr_name == 'raw':
-            subclass_name = self.__name__ + '__RAW'
-
-            @classmethod
-            def can_deserialize(cls,wire_format):
-                return True
-            dct['can_deserialize'] = can_deserialize
-            
-            @classmethod
-            def deserialize(cls,data,wire_format):
-                return data
-            dct['deserialize'] = deserialize
+        if attr_name == 'required':
+            subclass_name = self.__name__ + '__REQUIRED'
+            dct['REQUIRED'] = True
+            dct['INTERNAL_FORMAT'] = self.INTERNAL_FORMAT
         else:
-            subclass_name = self.__name__ + '__FORMAT_' + attr_name
+            dct['INTERNAL_FORMAT'] = attr_name
+            dct['REQUIRED'] = self.REQUIRED
+        
+            if attr_name == 'raw':
+                subclass_name = self.__name__ + '__RAW'
+    
+                @classmethod
+                def can_deserialize(cls,wire_format):
+                    return True
+                dct['can_deserialize'] = can_deserialize
+                
+                @classmethod
+                def deserialize(cls,data,wire_format):
+                    return data
+                dct['deserialize'] = deserialize
+            else:
+                internal_format_str = attr_name if isinstance(attr_name,basestring) else 'COMPLEX'
+                subclass_name = self.__name__ + '__FORMAT_' + internal_format_str
         return type(subclass_name,(self,),dct)
 
 class Serializer(SerializerBase):
@@ -415,51 +499,71 @@ class Serializer(SerializerBase):
             if trans.can_serialize(cls,data,cls.INTERNAL_FORMAT,None):
                 return trans.choose_wire_format(cls,data,is_list=is_list)
     
+    #Internal methods 
+    
     @classmethod
-    def is_binary(cls,wire_format):
-        """Subclasses of Serializer should override this method to return true
-        if any of the wire formats are binary (that is, need to be base64
-        encoded for sending in ASCII text)."""
+    def _call_choose_wire_format(cls,data,is_list=False):
+        return cls.choose_wire_format(data,is_list=is_list)
+    
+    @classmethod
+    def _call_is_binary(cls,wire_format):
         for trans in cls.translators():
             ret = trans.is_binary(cls,wire_format)
             if ret is not None:
                 return ret
-        return None
+        return cls.is_binary(wire_format)
     
     @classmethod
-    def can_deserialize(cls,wire_format):
+    def _call_can_deserialize(cls,wire_format):
         translators = cls.translators()
         if not cls.INTERNAL_FORMAT and not translators:
-            known_formats = cls.known_wire_formats()
-            return known_formats is NotImplemented or not known_formats or _check_format(wire_format, known_formats)
+            can = cls.can_deserialize(wire_format)
+            if can is NotImplemented:
+                known_formats = cls.known_wire_formats()
+                return known_formats is NotImplemented or not known_formats or _check_format(wire_format, known_formats)
+            else:
+                return can
         
         if cls.INTERNAL_FORMAT == 'raw' or wire_format == cls.INTERNAL_FORMAT:
             return True
         for trans in translators:
             if trans.can_deserialize(cls, wire_format, cls.INTERNAL_FORMAT):
                 return True
-        return False
+        can = cls.can_deserialize(wire_format)
+        if can is NotImplemented:
+            return False
+        else:
+            return can
     
     @classmethod
-    def can_serialize(cls,data,wire_format):
+    def _call_can_serialize(cls,data,wire_format):
         if not cls.INTERNAL_FORMAT and not cls.translators():
-            known_formats = cls.known_wire_formats()
-            return known_formats is NotImplemented or not known_formats or _check_format(wire_format, known_formats)
+            can = cls.can_serialize(data, wire_format)
+            if can is NotImplemented:
+                known_formats = cls.known_wire_formats()
+                return known_formats is NotImplemented or not known_formats or _check_format(wire_format, known_formats)
+            else:
+                return can
         
         if wire_format == cls.INTERNAL_FORMAT:
             return True
         for trans in cls.TRANSLATORS:
             if trans.can_serialize(cls, data, cls.INTERNAL_FORMAT, wire_format):
                 return True
-        return False
+        can = cls.can_serialize(data, wire_format)
+        if can is NotImplemented:
+            return False
+        else:
+            return can
     
     @classmethod
-    def deserialize(cls,data,wire_format):
-        """This method must be overridden if the subclass is not using Translators.
-        wire_format may be None if no format was indicated."""
+    def _call_deserialize(cls,data,wire_format):
         translators = cls.translators()
         if not translators:
-            raise NotImplementedError('deserialize() not implemented in %s' % str(cls))
+            data = cls.deserialize(data,wire_format)
+            if data is NotImplemented:
+                raise NotImplementedError('deserialize() not implemented in %s' % str(cls))
+            return data
         if wire_format:
             for trans in translators:
                 if trans.can_deserialize(cls, wire_format, cls.INTERNAL_FORMAT):
@@ -479,15 +583,16 @@ class Serializer(SerializerBase):
             raise SerializationError("%s could not deserialize data from wire format %s to internal format %s" % (cls.get_name(),wire_format,cls.INTERNAL_FORMAT))
         else:
             raise SerializationError("%s could not deserialize data from wire format %s" % (cls.get_name(),wire_format))
+        
 
     @classmethod
-    def serialize(cls,data,wire_format):
-        """This method must be overridden if the subclass is not using Translators.
-        If known_wire_formats is overridden (or the Translators return 
-        known_wire_formats) then wire_format will always be a valid value."""
+    def _call_serialize(cls,data,wire_format):
         translators = cls.translators()
         if not translators:
-            raise NotImplementedError('serialize() not implemented in %s' % str(cls))
+            data = cls.serialize(data,wire_format)
+            if data is NotImplemented:
+                raise NotImplementedError('serialize() not implemented in %s' % str(cls))
+            return data
         for trans in translators:
             if trans.can_serialize(cls,data,cls.INTERNAL_FORMAT,wire_format):
                 if not wire_format:
@@ -497,6 +602,7 @@ class Serializer(SerializerBase):
             raise SerializationError("%s could not serialize data from internal format %s to wire format %s" % (cls.get_name(),cls.INTERNAL_FORMAT,wire_format))
         else:
             raise SerializationError("%s could not serialize data to wire format %s" % (cls.get_name(),wire_format))
+        
         
 
 class SerializerField(object):
@@ -512,6 +618,17 @@ class SerializerField(object):
         SerializerField.instance_counter += 1
 
 class _MetaListSerializer(MetaSerializerBase):
+    def __call__(self,*args,**kwargs):
+        if args:
+            return _get_list_serializer(self.LIST_TYPE, args)
+        if not kwargs:
+            return self
+        if len(kwargs) != 1 or 'ndims' not in kwargs:
+            raise RuntimeError("Only valid kwarg for List is ndims of type int")
+        if kwargs['ndims'] is None:
+            return _get_list_serializer(self.LIST_TYPE, None)
+        return _get_list_serializer(self.LIST_TYPE, tuple(Ellipsis for _ in xrange(int(kwargs['ndims']))))
+    
     def __eq__(self, other):
         if inspect.isclass(other) and issubclass(other, _ListSerializer):
             return self.LIST_TYPE == other.LIST_TYPE and self.NUM_ELEM == other.NUM_ELEM
@@ -519,13 +636,18 @@ class _MetaListSerializer(MetaSerializerBase):
             return self.__eq__(other.__class__)
         else:
             return False
+    
+    def __getitem__(self, item):
+        raise RuntimeError("Cannot have lists of lists!")
 
 class _ListSerializer(SerializerBase):
     __metaclass__ = _MetaListSerializer
     
     @classmethod
     def get_name(cls):
-        return cls.LIST_TYPE.get_name() + '[' + str(cls.NUM_ELEM or '') + ']'
+        return cls.LIST_TYPE.get_name() + '[' + ','.join(str(elem or '...')
+                                                              for elem 
+                                                              in (cls.NUM_ELEM or [])) + ']'
     
     @classmethod
     def choose_wire_format(cls,data,is_list=False):
@@ -545,45 +667,80 @@ class _ListSerializer(SerializerBase):
         return all(cls.LIST_TYPE.can_serialize(d,wire_format) for d in data)
     
     @classmethod
-    def deserialize(cls,data,wire_format):
-        if cls.NUM_ELEM:
-            if data is None:
-                return None
-            elif len(data) != cls.NUM_ELEM:
-                raise SerializationError('%s requires exactly %d elements, got %d' % (cls.get_name(), cls.NUM_ELEM, len(data)))
-        deserialized_data = []
+    def _process_data(cls,function,data,format,num_elem=None,level=1,index=[0]):
+        if num_elem is None:
+            num_elem = cls.NUM_ELEM
+        if not num_elem:
+            return function(data, format)
+        processed_data = []
         for idx, data_elem in enumerate(data or []):
-            if isinstance(wire_format,list):
-                elem_wire_format = wire_format[idx]
+            if format is None or isinstance(format,basestring):
+                elem_format = format
             else:
-                elem_wire_format = wire_format
-            deserialized_data.append(cls.LIST_TYPE.deserialize(data_elem, elem_wire_format))
+                elem_format = format[idx]
+            processed_data.append(cls._process_data(function,data_elem, elem_format, 
+                                                     num_elem[1:], level+1,index + [idx]))
+        if num_elem[0] is not None and len(processed_data) != num_elem[0]:
+            raise SerializationError('%s requires exactly %d elements at index %s, got %d' % (
+                                     cls.get_name(), num_elem[0], tuple(index), len(processed_data)))
+        return processed_data
+    
+    @classmethod
+    def deserialize(cls,data,wire_format):
+        list_type = cls.LIST_TYPE
+        if cls.INTERNAL_FORMAT == 'entries_required':
+            list_type = list_type.required
+        def func(data,wire_format):
+            return deserialize(list_type,data,wire_format)
+        deserialized_data = cls._process_data(func, data, wire_format)
+        
+        from .serializers import Float, Int
+        if cls.INTERNAL_FORMAT == 'numpy' or (
+                cls.INTERNAL_FORMAT != 'list' and issubclass(cls.LIST_TYPE,(Float,Int))):
+            import numpy
+            deserialized_data = numpy.array(deserialized_data)
+        
         return deserialized_data
 
     @classmethod
     def serialize(cls,data,wire_format):
-        if cls.NUM_ELEM:
-            if data is None:
-                return None
-            elif len(data) != cls.NUM_ELEM:
-                raise SerializationError('%s requires exactly %d elements, got %d' % (cls.get_name(), cls.NUM_ELEM, len(data)))
-        serialized_data = []
-        for idx, data_elem in enumerate(data or []):
-            if isinstance(wire_format,list):
-                elem_wire_format = wire_format[idx]
-            else:
-                elem_wire_format = wire_format
-            serialized_data.append(cls.LIST_TYPE.serialize(data_elem, elem_wire_format))
-        return serialized_data
+        list_type = cls.LIST_TYPE
+        if cls.INTERNAL_FORMAT == 'entries_required':
+            list_type = list_type.required
+        def func(data,wire_format):
+            return serialize(list_type,data,wire_format)
+        return cls._process_data(func, data, wire_format, cls.NUM_ELEM, 1)
 
-def _get_list_serializer(list_type, num_elem=None):
-    if isinstance(num_elem, int):
-        if num_elem <= 0:
-            num_elem = None
-    elif num_elem is Ellipsis:
-        num_elem = None
-    elif num_elem is not None:
-        raise TypeError("%s is not a valid list length!" % num_elem)
+def _check_num_elem_entry(entry):
+    if isinstance(entry, int):
+        if entry <= 0:
+            return None
+        else:
+            return entry
+    elif entry is Ellipsis or entry is None:
+        return None
+    else:
+        raise TypeError("%s is not a valid list of dimensions!" % entry)
+
+def _get_list_serializer(list_type, num_elem=None, autoconvert=None):
+    if autoconvert is None:
+        autoconvert = AUTOCONVERT_LIST
+    if not isinstance(num_elem,collections.Iterable):
+        num_elem = (_check_num_elem_entry(num_elem),)
+    else:
+        num_elem = tuple(_check_num_elem_entry(entry) for entry in num_elem)
+    
+    from .serializers import Float, Vector, Matrix
+    if issubclass(list_type,Float) and autoconvert:
+        if len(num_elem) == 1:
+            return Vector(num_elem)
+        if len(num_elem) == 2:
+            if num_elem[0] == 1 and num_elem[1] != 1:
+                return Vector(num_elem[1]).rowmatrix
+            elif num_elem[0] != 1 and num_elem[1] == 1:
+                return Vector(num_elem[1]).colmatrix
+            return Matrix(*num_elem)
+    
     name = list_type.__name__ + '__LIST'
     dct = {'LIST_TYPE': list_type, 'NUM_ELEM': num_elem, '__base_type__': list_type.get_unformatted_type(), '__parent_type__': list_type}
 
@@ -596,8 +753,10 @@ def _get_list_serializer_field(value):
         return None, None
     return _get_list_serializer(value.value), value.counter
 
-def List(list_type, num_elem=None):
-    return _get_list_serializer(list_type, num_elem)
+def List(list_type, num_elem=None, ndims=None, autoconvert=None):
+    if ndims is not None:
+        num_elem = tuple(Ellipsis for _ in xrange(int(ndims)))
+    return _get_list_serializer(list_type, num_elem, autoconvert=autoconvert)
 
 class _MetaDictSerializer(MetaSerializerBase):
     def __eq__(self, other):
@@ -1096,9 +1255,9 @@ def instantiate_serializer(serializer,*args,**kwargs):
     elif issubclass(serializer,Struct):
         return serializer(*args,**kwargs)
     elif issubclass(serializer, _ListSerializer):
-        if serializer.NUM_ELEM and len(args) != serializer.NUM_ELEM:
-            raise SerializationError('%s requires exactly %d elements, got %d' % (serializer.get_name(), serializer.NUM_ELEM, len(args)))
-        return [instantiate_serializer(serializer.__parent_type__,value,**kwargs) for value in args]
+        def func(data,wire_format):
+            instantiate_serializer(serializer.__parent_type__,data,**kwargs)
+        return serializer._process_data(func, args, None)
     elif issubclass(serializer, _DictSerializer):
         data = {}
         for key, value in kwargs.iteritems():
@@ -1251,11 +1410,14 @@ class SerializerRegistry(object):
             serializer = eval('serializer.' + groups['format'])
         
         array = groups['array']
-        while array.startswith('['):
-            match = re.match(r'\[(?P<num>\d*)\]',array)
-            num_elem = int(match.group('num')) if match.group('num') else None
-            serializer = _get_list_serializer(serializer,num_elem=num_elem)
-            array = array[match.end()+1:]
+        if array:
+            dimstrs = array[1:-1].split(',')
+            dims = []
+            for dimstr in dimstrs:
+                dim = Ellipsis if dimstr == '...' else int(dimstr)
+                dims.append(dim)
+            #TODO: autoconvert=False?
+            serializer = _get_list_serializer(serializer,num_elem=dims)
         
         return serializer
 

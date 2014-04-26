@@ -1,9 +1,17 @@
 from __future__ import absolute_import
 
 from .serializer import *
-import numpy, sys
+from .serializer import _get_list_serializer
+import sys
 import time, datetime
 import json
+
+_NUMPY = False
+try:
+    import numpy
+    _NUMPY = True
+except:
+    pass
 
 from cStringIO import StringIO
 
@@ -13,26 +21,24 @@ class PrimitiveTypeSerializer(Serializer):
     PRIMITIVE_TYPE = None
     
     @classmethod
+    def is_nonesafe(cls):
+        return cls.INTERNAL_FORMAT == 'default'
+    
+    @classmethod
     def known_wire_formats(cls):
         return []
     
     @classmethod
     def deserialize(cls,data,wire_format):
-        if data is None:
-            if cls.INTERNAL_FORMAT == 'default':
-                return cls.PRIMITIVE_TYPE()
-            return None
-        else:
-            return cls.PRIMITIVE_TYPE(data)
+        if data is None and cls.INTERNAL_FORMAT == 'default':
+            return cls.PRIMITIVE_TYPE()
+        return cls.PRIMITIVE_TYPE(data)
 
     @classmethod
     def serialize(cls,data,wire_format):
-        if data is None:
-            if cls.INTERNAL_FORMAT == 'default':
-                return cls.PRIMITIVE_TYPE()
-            return None
-        else:
-            return cls.PRIMITIVE_TYPE(data)
+        if data is None and cls.INTERNAL_FORMAT == 'default':
+            return cls.PRIMITIVE_TYPE()
+        return cls.PRIMITIVE_TYPE(data)
 
 class Bool(PrimitiveTypeSerializer):
     PRIMITIVE_TYPE = bool    
@@ -45,51 +51,6 @@ class Float(PrimitiveTypeSerializer):
 
 class String(PrimitiveTypeSerializer):
     PRIMITIVE_TYPE = str
-
-class NDArray(Serializer):
-    @classmethod
-    def _check(cls,mat,check_dtype):
-        shape = cls.PARAMETER_LIST
-        if shape:
-            if len(shape) != mat.ndim:
-                raise SerializationError('Array must be %d-dimensional, got %d' % (mat.ndim, len(shape)))
-            for idx, req_size, mat_size in zip(xrange(len(shape)),shape,mat.shape):
-                if req_size and mat_size != req_size:
-                    raise SerializationError('Array dimension %d must be size %d, got %d' % (idx,req_size,mat_size))
-        ndim = cls.PARAMETER_DICT.get('ndim')
-        if ndim and mat.ndim != ndim:
-            raise SerializationError('Array must be %d-dimensional, got %d' % (mat.ndim, ndim))
-        dtype = cls.PARAMETER_DICT.get('dtype')
-        if dtype and check_dtype:
-            mat = numpy.asarray(mat, dtype=dtype)
-        return mat
-    
-    @classmethod
-    def is_binary(cls, wire_format):
-        return True
-    
-    @classmethod
-    def known_wire_formats(cls):
-        return ['numpy']
-    
-    @classmethod
-    def deserialize(cls, data, wire_format):
-        mat = numpy.load(StringIO(data))
-        mat = cls._check(mat, check_dtype=True)
-        return mat
-    
-    @classmethod
-    def serialize(cls, data, wire_format):
-        data = cls._check(data, check_dtype=False)
-        sio = StringIO()
-        numpy.save(sio, data)
-        return sio.getvalue()
-    
-    @classmethod
-    def _PARAMETER_CHECK(cls,*args,**kwargs):
-        ndim = kwargs.get('ndim')
-        if args and ndim and len(args) != ndim:
-            raise ValueError("Array shape %s and dimension %d are inconsistent!" % (args,ndim))
 
 class Blob(Serializer):
     @classmethod
@@ -245,29 +206,52 @@ class Image(Serializer):
 
 class Vector(Serializer):
     @classmethod
+    def force_list(cls):
+        dim = cls.PARAMETER_LIST[0] if cls.PARAMETER_LIST else None
+        return _get_list_serializer(Float, dim, autoconvert=False)
+    
+    @classmethod
     def is_binary(cls, wire_format):
-        return True
+        if wire_format in ['numpy']:
+            return True
+        return False
     
     @classmethod
     def known_wire_formats(cls):
-        return ['numpy']
+        return ['list','numpy']
     
     @classmethod
     def deserialize(cls, data, wire_format):
-        mat = numpy.load(StringIO(data))
-        dim = cls.PARAMETER_LIST or None
+        if wire_format == 'numpy':
+            mat = numpy.load(StringIO(data))
+        else:
+            mat = numpy.array(data)
+        dim = cls.PARAMETER_LIST[0] if cls.PARAMETER_LIST else None
         if dim and mat.size != dim:
             raise SerializationError('This vector must have dimension %d, but it is %d!' % (dim, mat.size))
+        
+        if cls.INTERNAL_FORMAT in ['row','rowmatrix']:
+            mat = mat.reshape((1,mat.size))
+        elif cls.INTERNAL_FORMAT in ['col','column','colmatrix','columnmatrix']:
+            mat = mat.reshape((mat.size,1))
+        
         return mat
     
     @classmethod
     def serialize(cls, data, wire_format):
-        dim = cls.PARAMETER_LIST or None
+        dim = cls.PARAMETER_LIST[0] if cls.PARAMETER_LIST else None
         if dim and data.size != dim:
             raise SerializationError('This vector must have dimension %d, but it is %d!' % (dim, data.size))
-        sio = StringIO()
-        numpy.save(sio, data)
-        return sio.getvalue()
+        if wire_format == 'numpy':
+            data = numpy.asarray(data,dtype=float).flatten()
+            sio = StringIO()
+            numpy.save(sio, data)
+            data = sio.getvalue()
+        else:
+            if isinstance(data,numpy.ndarray):
+                data = data.tolist()
+        
+        return data
     
     @classmethod
     def _PARAMETER_CHECK(cls,*args,**kwargs):
@@ -276,17 +260,27 @@ class Vector(Serializer):
 
 class Matrix(Serializer):
     @classmethod
+    def force_list(cls):
+        dim = cls.PARAMETER_LIST if cls.PARAMETER_LIST else (None,None)
+        return _get_list_serializer(Float, dim, autoconvert=False)
+    
+    @classmethod
     def is_binary(cls, wire_format):
-        return True
+        if wire_format in ['numpy']:
+            return True
+        return False
     
     @classmethod
     def known_wire_formats(cls):
-        return ['numpy']
+        return ['list','numpy']
     
     @classmethod
     def deserialize(cls, data, wire_format):
-        mat = numpy.load(StringIO(data))
-        rows, cols = cls.PARAMETER_LIST or (None,None)
+        if wire_format == 'numpy':
+            mat = numpy.load(StringIO(data))
+        else:
+            mat = numpy.array(data)
+        rows,cols = cls.PARAMETER_LIST if cls.PARAMETER_LIST else (None,None)
         if rows and mat.shape[0] != rows:
             raise SerializationError('This matrix must have %d rows, but it has shape %s!' % (rows, mat.shape))
         if cols and mat.shape[1] != cols:
@@ -295,53 +289,36 @@ class Matrix(Serializer):
     
     @classmethod
     def serialize(cls, data, wire_format):
-        rows, cols = cls.PARAMETER_LIST or (None,None)
-        if rows and data.shape[0] != rows:
-            raise SerializationError('This matrix must have %d rows, but it has shape %s!' % (rows, data.shape))
-        if cols and data.shape[1] != cols:
-            raise SerializationError('This matrix must have %d columns, but it has shape %s!' % (cols, data.shape))
-        sio = StringIO()
-        numpy.save(sio, data)
-        return sio.getvalue()
-    
-    @classmethod
-    def _PARAMETER_CHECK(cls,*args,**kwargs):
-        if kwargs or len(args) != 2:
-            raise ValueError("Matrix parameters must be rows and columns!")
-
-class IntegerMatrix(Serializer):
-    @classmethod
-    def is_binary(cls, wire_format):
-        return True
-    
-    @classmethod
-    def known_wire_formats(cls):
-        return ['numpy']
-    
-    @classmethod
-    def deserialize(cls, data, wire_format):
-        mat = numpy.load(StringIO(data))
-        rows, cols = cls.PARAMETER_LIST or (None,None)
-        if rows and mat.shape[0] != rows:
-            raise SerializationError('This matrix must have %d rows, but it has shape %s!' % (rows, mat.shape))
-        if cols and mat.shape[1] != cols:
-            raise SerializationError('This matrix must have %d columns, but it has shape %s!' % (cols, mat.shape))
-        if not re.match(r'u?int',str(mat.dtype)):
-            raise SerializationError('IntegerMatrix given non-integer data!')
-        return mat
-    
-    @classmethod
-    def serialize(cls, data, wire_format):
-        if not re.match(r'u?int',str(data.dtype)):
-            raise SerializationError('IntegerMatrix given non-integer data!')
-        rows, cols = cls.PARAMETER_LIST or (None,None)
-        if rows and data.shape[0] != rows:
-            raise SerializationError('This matrix must have %d rows, but it has shape %s!' % (rows, data.shape))
-        if cols and data.shape[1] != cols:
-            raise SerializationError('This matrix must have %d columns, but it has shape %s!' % (cols, data.shape))
-        sio = StringIO()
-        numpy.save(sio, data)
-        return sio.getvalue()
+        rows,cols = cls.PARAMETER_LIST if cls.PARAMETER_LIST else (None,None)
+        if wire_format == 'numpy':
+            data = numpy.asarray(data,dtype=float)
+            
+            if rows and data.shape[0] != rows:
+                raise SerializationError('This matrix must have %d rows, but it has shape %s!' % (rows, data.shape))
+            if cols and data.shape[1] != cols:
+                raise SerializationError('This matrix must have %d columns, but it has shape %s!' % (cols, data.shape))
+            
+            sio = StringIO()
+            numpy.save(sio, data)
+            data = sio.getvalue()
+        else:
+            checked = False
+            if isinstance(data,numpy.ndarray):
+                checked = True
+                if rows and data.shape[0] != rows:
+                    raise SerializationError('This matrix must have %d rows, but it has shape %s!' % (rows, data.shape))
+                if cols and data.shape[1] != cols:
+                    raise SerializationError('This matrix must have %d columns, but it has shape %s!' % (cols, data.shape))
+                data = data.tolist()
+            
+            if not checked:
+                if len(data) != rows:
+                    raise SerializationError('This matrix must have %d rows, but it has %d!' % (rows, len(data)))
+                for idx, value in enumerate(data):
+                    if len(value) != cols:
+                        raise SerializationError('This matrix must have %d cols, but row %d has %d!' % (cols, idx, len(data)))
+        
+        return data
     
     @classmethod
     def _PARAMETER_CHECK(cls,*args,**kwargs):
@@ -375,6 +352,6 @@ class PointCloud(Serializer):
             raise NotImplementedError()
 
 if not SerializerRegistry._builtins:
-    SerializerRegistry._register_builtins(Bool,Int,Float,String,NDArray,Blob,Timestamp,Duration,Pose,Transform,Vector,Matrix,IntegerMatrix,Image,PointCloud)
+    SerializerRegistry._register_builtins(Bool,Int,Float,String,Blob,Timestamp,Duration,Pose,Transform,Vector,Matrix,Image,PointCloud)
 
 from . import translators
